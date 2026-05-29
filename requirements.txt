@@ -1,0 +1,12 @@
+langchain>=0.1.0
+langchain-google-vertexai>=0.1.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+pypdf>=3.17.0
+psycopg2-binary>=2.9.9
+pgvector>=0.2.4
+pytest>=7.4.0
+httpx>=0.25.0
+rouge-score>=0.1.2
