@@ -51,7 +51,7 @@ GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 uvicorn app.main:app --reload
 ```
 
-Visit: http://localhost:8000/docs
+Visit: http://localhost:8000/health
 
 ## API Endpoints
 
