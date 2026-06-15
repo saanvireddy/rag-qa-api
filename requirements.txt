@@ -1,4 +1,4 @@
-echo "fastapi
+fastapi
 uvicorn
 langchain
 langchain-community
@@ -11,4 +11,4 @@ pypdf
 python-multipart
 python-dotenv
 streamlit
-requests" > requirements.txt
+requests
