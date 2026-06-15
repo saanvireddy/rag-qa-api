@@ -1,3 +1,13 @@
+---
+title: RAG QA Assistant
+emoji: 🧠
+colorFrom: purple
+colorTo: blue
+sdk: streamlit
+sdk_version: "1.32.0"
+app_file: app/streamlit_app.py
+pinned: false
+---
 # RAG-based Document Q&A API
 
 Production-ready Retrieval-Augmented Generation (RAG) service for querying documents with LLMs.
