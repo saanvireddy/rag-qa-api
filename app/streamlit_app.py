@@ -4,11 +4,13 @@ import time
 import os
 import subprocess
 import threading
+import time
 
 def start_api():
     subprocess.Popen(["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"])
-
+    
 threading.Thread(target=start_api, daemon=True).start()
+time.sleep(3)
 # ── Config ──────────────────────────────────────────────────────────────────
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
