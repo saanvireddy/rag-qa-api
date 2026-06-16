@@ -1,18 +1,10 @@
 import streamlit as st
-import requests
-import time
 import os
-import subprocess
-import threading
 import time
+import tempfile
+from dotenv import load_dotenv
 
-def start_api():
-    subprocess.Popen(["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"])
-    
-threading.Thread(target=start_api, daemon=True).start()
-time.sleep(3)
-# ── Config ──────────────────────────────────────────────────────────────────
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+load_dotenv()
 
 st.set_page_config(
     page_title="RAG Document Q&A",
@@ -20,108 +12,120 @@ st.set_page_config(
     layout="wide"
 )
 
-# ── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .main { padding-top: 1rem; }
-    .chat-message { padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem; }
-    .user-message { background-color: #1e3a5f; color: white; }
-    .assistant-message { background-color: #1e1e2e; color: #e0e0e0; border-left: 3px solid #4a9eff; }
-    .source-tag { background: #2a2a3e; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; color: #888; margin-right: 4px; }
-    .latency-tag { color: #666; font-size: 0.75rem; }
-    .stButton > button { width: 100%; }
-    h1 { color: #4a9eff; }
+.chat-message { padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem; }
+.user-message { background-color: #1e3a5f; color: white; }
+.assistant-message { background-color: #1e1e2e; color: #e0e0e0; border-left: 3px solid #4a9eff; }
+.source-tag { background: #2a2a3e; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; color: #888; margin-right: 4px; }
+.latency-tag { color: #666; font-size: 0.75rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session State ────────────────────────────────────────────────────────────
+# ── Init RAG pipeline once ───────────────────────────────────────────────────
+@st.cache_resource
+def load_pipeline():
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_community.vectorstores import Chroma
+    from langchain_groq import ChatGroq
+
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    vectorstore = Chroma(
+        persist_directory="./chroma_db",
+        embedding_function=embeddings
+    )
+    llm = ChatGroq(
+        model="llama-3.3-70b-versatile",
+        api_key=os.getenv("GROQ_API_KEY"),
+        temperature=0.1
+    )
+    return embeddings, vectorstore, llm
+
+# ── Session state ────────────────────────────────────────────────────────────
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "uploaded_files" not in st.session_state:
     st.session_state.uploaded_files = []
 if "total_queries" not in st.session_state:
     st.session_state.total_queries = 0
-if "avg_latency" not in st.session_state:
-    st.session_state.avg_latency = []
+if "latencies" not in st.session_state:
+    st.session_state.latencies = []
+
+# ── Load pipeline ────────────────────────────────────────────────────────────
+with st.spinner("Loading AI pipeline..."):
+    try:
+        embeddings, vectorstore, llm = load_pipeline()
+        pipeline_ok = True
+    except Exception as e:
+        pipeline_ok = False
+        pipeline_error = str(e)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-def check_api_health():
-    try:
-        r = requests.get(f"{API_URL}/health", timeout=3)
-        return r.status_code == 200
-    except:
-        return False
+def ingest_pdf(file_bytes, filename):
+    from langchain_community.document_loaders import PyPDFLoader
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-def upload_document(file_bytes, filename):
-    try:
-        r = requests.post(
-            f"{API_URL}/documents/upload",
-            files={"file": (filename, file_bytes, "application/pdf")},
-            timeout=60
-        )
-        return r.json() if r.status_code == 200 else None
-    except Exception as e:
-        return None
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.write(file_bytes)
+    tmp.close()
 
-def query_rag(question, chat_history):
-    """Query with chat history context injected into question"""
-    try:
-        # Build context from last 3 exchanges
-        context = ""
-        if chat_history:
-            recent = chat_history[-3:]
-            for msg in recent:
-                role = "User" if msg["role"] == "user" else "Assistant"
-                context += f"{role}: {msg['content']}\n"
-            question_with_context = f"{question}\n\n(Context from previous turns: {context})"
-        else:
-            question_with_context = question
+    loader = PyPDFLoader(tmp.name)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
+    texts = [c.page_content for c in chunks]
+    metadatas = [{"source": filename} for _ in chunks]
+    vectorstore.add_texts(texts=texts, metadatas=metadatas)
+    os.unlink(tmp.name)
+    return len(chunks)
 
-        r = requests.post(
-            f"{API_URL}/query",
-            json={"question": question_with_context},
-            timeout=30
-        )
-        if r.status_code == 200:
-            return r.json()
-        return None
-    except Exception as e:
-        return None
+def query_rag(question):
+    start = time.time()
+    results = vectorstore.similarity_search(question, k=3)
+    if not results:
+        return "No relevant documents found. Please upload a PDF first.", [], 0
+
+    context = "\n\n".join([f"[Source: {r.metadata.get('source','unknown')}]\n{r.page_content}" for r in results])
+    sources = list(set([r.metadata.get('source','unknown') for r in results]))
+
+    prompt = f"""Based on the following documents, answer the question concisely and accurately.
+If the answer is not in the documents, say so clearly.
+
+Documents:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+    response = llm.invoke(prompt)
+    latency = round((time.time() - start) * 1000, 1)
+    return response.content, sources, latency
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🧠 RAG Q&A")
-    st.caption("Powered by Vertex AI (Gemini) + pgvector")
+    st.caption("Powered by Groq (Llama 3.3) + ChromaDB")
 
-    # API Status
-    api_ok = check_api_health()
-    if api_ok:
-        st.success("API Connected ✅")
+    if pipeline_ok:
+        st.success("Pipeline Ready ✅")
     else:
-        st.error("API Offline ❌")
-        st.caption(f"Expected at: {API_URL}")
+        st.error(f"Pipeline Error ❌\n{pipeline_error}")
 
     st.divider()
-
-    # Document Upload
     st.subheader("📄 Upload Documents")
-    uploaded = st.file_uploader(
-        "Upload PDF files",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="Upload one or more PDF documents to query"
-    )
+    uploaded = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
 
-    if uploaded:
+    if uploaded and pipeline_ok:
         for f in uploaded:
             if f.name not in st.session_state.uploaded_files:
                 with st.spinner(f"Processing {f.name}..."):
-                    result = upload_document(f.read(), f.name)
-                    if result:
+                    try:
+                        chunks = ingest_pdf(f.read(), f.name)
                         st.session_state.uploaded_files.append(f.name)
-                        st.success(f"✅ {f.name} ({result.get('chunks_processed', '?')} chunks)")
-                    else:
-                        st.error(f"❌ Failed to upload {f.name}")
+                        st.success(f"✅ {f.name} ({chunks} chunks)")
+                    except Exception as e:
+                        st.error(f"❌ Failed: {str(e)}")
 
     if st.session_state.uploaded_files:
         st.divider()
@@ -130,120 +134,56 @@ with st.sidebar:
             st.markdown(f"- {fname}")
 
     st.divider()
-
-    # Stats
     st.subheader("📊 Session Stats")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Queries", st.session_state.total_queries)
-    with col2:
-        avg = round(sum(st.session_state.avg_latency) / len(st.session_state.avg_latency), 0) if st.session_state.avg_latency else 0
-        st.metric("Avg Latency", f"{avg}ms")
+    c1, c2 = st.columns(2)
+    c1.metric("Queries", st.session_state.total_queries)
+    avg = round(sum(st.session_state.latencies)/len(st.session_state.latencies)) if st.session_state.latencies else 0
+    c2.metric("Avg Latency", f"{avg}ms")
 
-    st.divider()
-
-    # Clear chat
-    if st.button("🗑️ Clear Chat History"):
+    if st.button("🗑️ Clear Chat"):
         st.session_state.chat_history = []
         st.session_state.total_queries = 0
-        st.session_state.avg_latency = []
+        st.session_state.latencies = []
         st.rerun()
 
-# ── Main Area ─────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 st.title("RAG Document Q&A Assistant")
-st.caption("Upload PDFs in the sidebar, then ask questions below. Chat memory is maintained across turns.")
+st.caption("Upload PDFs in the sidebar, then ask questions below. Chat memory maintained across turns.")
 
-# Example questions
 if not st.session_state.chat_history:
-    st.info("👋 Upload a PDF document in the sidebar to get started, then ask any question about it.")
-    st.markdown("**Example questions:**")
+    st.info("👋 Upload a PDF document in the sidebar to get started.")
     cols = st.columns(3)
-    examples = [
-        "What is the main topic of this document?",
-        "Summarize the key findings",
-        "What are the conclusions?"
-    ]
-    for i, ex in enumerate(examples):
-        with cols[i]:
-            if st.button(ex, key=f"ex_{i}"):
-                st.session_state.pending_question = ex
-                st.rerun()
+    for i, ex in enumerate(["What is the main topic?", "Summarize key findings", "What are the conclusions?"]):
+        if cols[i].button(ex, key=f"ex{i}"):
+            st.session_state["pending"] = ex
+            st.rerun()
 
-# Chat history display
-chat_container = st.container()
-with chat_container:
-    for msg in st.session_state.chat_history:
-        if msg["role"] == "user":
-            st.markdown(f"""
-            <div class="chat-message user-message">
-                <strong>You:</strong> {msg['content']}
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            sources_html = ""
-            if msg.get("sources"):
-                for s in msg["sources"]:
-                    fname = s.split("/")[-1]
-                    sources_html += f'<span class="source-tag">📄 {fname}</span>'
-            latency_html = f'<span class="latency-tag"> · {msg.get("latency_ms", "")}ms</span>' if msg.get("latency_ms") else ""
-            st.markdown(f"""
-            <div class="chat-message assistant-message">
-                <strong>Assistant:</strong> {msg['content']}
-                <br><br>{sources_html}{latency_html}
-            </div>
-            """, unsafe_allow_html=True)
-
-# Input
-st.divider()
-col_input, col_btn = st.columns([5, 1])
-
-with col_input:
-    question = st.text_input(
-        "Ask a question",
-        placeholder="Type your question here...",
-        label_visibility="collapsed",
-        key="question_input",
-        value=st.session_state.get("pending_question", "")
-    )
-
-with col_btn:
-    ask_clicked = st.button("Ask ➤", type="primary")
-
-# Clear pending question
-if "pending_question" in st.session_state:
-    del st.session_state.pending_question
-
-# Handle query
-if (ask_clicked or question) and question.strip():
-    if not api_ok:
-        st.error("API is offline. Please start the FastAPI server first.")
-    elif not st.session_state.uploaded_files:
-        st.warning("Please upload at least one PDF document first.")
+for msg in st.session_state.chat_history:
+    if msg["role"] == "user":
+        st.markdown(f'<div class="chat-message user-message"><strong>You:</strong> {msg["content"]}</div>', unsafe_allow_html=True)
     else:
-        # Add user message
-        st.session_state.chat_history.append({
-            "role": "user",
-            "content": question
-        })
+        src_html = "".join([f'<span class="source-tag">📄 {s.split("/")[-1]}</span>' for s in msg.get("sources",[])])
+        lat_html = f'<span class="latency-tag"> · {msg.get("latency_ms","")}ms</span>'
+        st.markdown(f'<div class="chat-message assistant-message"><strong>Assistant:</strong> {msg["content"]}<br><br>{src_html}{lat_html}</div>', unsafe_allow_html=True)
 
+st.divider()
+col1, col2 = st.columns([5,1])
+with col1:
+    question = st.text_input("Ask", placeholder="Type your question here...", label_visibility="collapsed",
+                              value=st.session_state.pop("pending", ""), key="q_input")
+with col2:
+    ask = st.button("Ask ➤", type="primary")
+
+if ask and question.strip():
+    if not pipeline_ok:
+        st.error("Pipeline not loaded.")
+    elif not st.session_state.uploaded_files:
+        st.warning("Please upload a PDF first.")
+    else:
+        st.session_state.chat_history.append({"role": "user", "content": question})
         with st.spinner("Thinking..."):
-            result = query_rag(question, st.session_state.chat_history[:-1])
-
-        if result:
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": result["answer"],
-                "sources": result.get("sources", []),
-                "latency_ms": result.get("latency_ms", 0)
-            })
-            st.session_state.total_queries += 1
-            st.session_state.avg_latency.append(result.get("latency_ms", 0))
-        else:
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": "Sorry, I couldn't get an answer. Please check if the API is running.",
-                "sources": [],
-                "latency_ms": 0
-            })
-
+            answer, sources, latency = query_rag(question)
+        st.session_state.chat_history.append({"role": "assistant", "content": answer, "sources": sources, "latency_ms": latency})
+        st.session_state.total_queries += 1
+        st.session_state.latencies.append(latency)
         st.rerun()
