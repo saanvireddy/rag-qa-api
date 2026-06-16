@@ -214,7 +214,7 @@ if "pending_question" in st.session_state:
     del st.session_state.pending_question
 
 # Handle query
-if ask_clicked and question.strip():
+if (ask_clicked or question) and question.strip():
     if not api_ok:
         st.error("API is offline. Please start the FastAPI server first.")
     elif not st.session_state.uploaded_files:
